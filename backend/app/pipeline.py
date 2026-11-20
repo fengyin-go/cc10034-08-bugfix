@@ -82,10 +82,18 @@ class PipelineBus:
         self.checkpoints: list[CheckpointRecord] = []
         # Schema 注册 — schema_sync 写入，ddl_tracker/format_adapter 消费
         self.schema_registry: dict[str, list[dict[str, Any]]] = {}
-        # SCD 状态 — scd_handler 核心存储
-        self.scd_type1_store: dict[str, dict[str, Any]] = {}  # snapshot
-        self.scd_type2_store: dict[str, list[dict[str, Any]]] = {}  # history
-        self.scd_type3_store: dict[str, dict[str, Any]] = {}  # prev-col
+        # SCD 状态 — scd_handler 核心存储。
+        # 外层 key 必须是维度表：不同维表即使自然键相同，也必须各自持有独立的版本链，
+        # 否则 Type2 追加版本时会错误关闭另一张维表的当前有效版本。
+        self.scd_type1_store: dict[str, dict[str, dict[str, Any]]] = {}  # dim -> nk -> snapshot
+        self.scd_type2_store: dict[str, dict[str, list[dict[str, Any]]]] = {}  # dim -> nk -> history
+        self.scd_type3_store: dict[str, dict[str, dict[str, Any]]] = {}  # dim -> nk -> prev-col
+        # 事件回放清单 — 每个进入 SCD 处理的变更事件都留一条处置记录，
+        # 与 scd_type2_store 中的版本通过 (维度表, 自然键, 版本, 摘要) 核对。
+        self.scd_replay_manifest: list[dict[str, Any]] = []
+        # 幂等索引：维度表 + 自然键 + 事件ID -> 回放清单记录下标（0 基），
+        # 重复提交直接复用首次处置，不会再次关闭任何版本。
+        self.scd_replay_index: dict[str, int] = {}
         # 去重状态 — dedup_window 核心存储
         self.dedup_state: dict[str, list[dict[str, Any]]] = defaultdict(list)
         # 路由规则 — route_dispatcher 核心配置
@@ -162,31 +170,48 @@ class PipelineBus:
         raw = f"{event.event_id}:{event.source_table}:{event.operation}:{event.binlog_file}:{event.binlog_pos}"
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
-    def apply_scd_type1(self, dim_key: str, row: dict[str, Any]) -> dict[str, Any]:
-        """SCD Type1：覆盖式更新。"""
-        existing = self.scd_type1_store.get(dim_key)
+    def apply_scd_type1(self, dim_table: str, dim_key: str, row: dict[str, Any]) -> dict[str, Any]:
+        """SCD Type1：覆盖式更新，按维度表隔离。"""
+        table_store = self.scd_type1_store.setdefault(dim_table, {})
+        existing = table_store.get(dim_key)
         if existing:
             existing.update(row)
         else:
-            existing = row
-        self.scd_type1_store[dim_key] = existing
+            existing = dict(row)
+        table_store[dim_key] = existing
         return existing
 
-    def apply_scd_type2(self, dim_key: str, row: dict[str, Any]) -> list[dict[str, Any]]:
-        """SCD Type2：保留完整历史。"""
-        history = self.scd_type2_store.setdefault(dim_key, [])
+    def apply_scd_type2(self, dim_table: str, dim_key: str, row: dict[str, Any]) -> list[dict[str, Any]]:
+        """SCD Type2：保留完整历史，版本链按维度表隔离。"""
+        table_store = self.scd_type2_store.setdefault(dim_table, {})
+        history = table_store.setdefault(dim_key, [])
         row["version"] = len(history) + 1
         history.append(dict(row))
         return list(history)
 
-    def apply_scd_type3(self, dim_key: str, col_name: str, row: dict[str, Any]) -> dict[str, Any]:
-        """SCD Type3：保留前值列。"""
-        existing = self.scd_type3_store.get(dim_key)
+    def apply_scd_type3(self, dim_table: str, dim_key: str, col_name: str,
+                        row: dict[str, Any]) -> dict[str, Any]:
+        """SCD Type3：保留前值列，按维度表隔离。"""
+        table_store = self.scd_type3_store.setdefault(dim_table, {})
+        existing = table_store.get(dim_key)
         result = dict(row)
         if existing:
             result[f"_previous_{col_name}"] = existing.get(col_name)
-        self.scd_type3_store[dim_key] = result
+        table_store[dim_key] = result
         return result
+
+    def get_scd_type2_history(self, dim_table: str, dim_key: str) -> list[dict[str, Any]]:
+        """读取指定维度表、指定自然键的 Type2 版本链（副本，避免调用方误改存储）。"""
+        return [dict(row) for row in self.scd_type2_store.get(dim_table, {}).get(dim_key, [])]
+
+    def iter_scd_type2(self) -> list[tuple[str, str, dict[str, Any]]]:
+        """遍历全部 Type2 版本：(维度表, 自然键, 版本行)。"""
+        return [
+            (dim_table, dim_key, row)
+            for dim_table, keys in self.scd_type2_store.items()
+            for dim_key, history in keys.items()
+            for row in history
+        ]
 
     def window_dedup(self, dedup_key: str, event_id: str, window_sec: float) -> bool:
         """窗口去重：检查指定 key 在窗口期内是否已有事件。"""
@@ -323,9 +348,11 @@ class PipelineBus:
             "position_count": len(self.positions),
             "checkpoint_count": len(self.checkpoints),
             "register_count": len(self.schema_registry),
-            "scd_type1_keys": len(self.scd_type1_store),
-            "scd_type2_keys": len(self.scd_type2_store),
-            "scd_type3_keys": len(self.scd_type3_store),
+            "scd_type1_keys": sum(len(keys) for keys in self.scd_type1_store.values()),
+            "scd_type2_keys": sum(len(keys) for keys in self.scd_type2_store.values()),
+            "scd_type3_keys": sum(len(keys) for keys in self.scd_type3_store.values()),
+            "scd_type2_tables": len(self.scd_type2_store),
+            "scd_replay_manifest": len(self.scd_replay_manifest),
             "audit_count": len(self.audit_log),
             "lag_buffer_size": len(self.lag_buffer),
         }

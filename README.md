@@ -77,5 +77,22 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 缓慢变化维版本链
+
+Type2 版本按 `维度表 -> 自然键 -> 版本列表` 两层键存储（`pipeline_bus.scd_type2_store`），
+两张维表即使提交相同自然键也各自持有独立版本链，追加版本只关闭本维表的当前版本。
+
+- 变更事件入口在 `change_event` / `scd_handler`；事件承载来源维度、自然键与字段差异，
+  缺来源维度的事件标记 `unresolved`，不会借用别的维表配置落库。
+- `app/routers/scd.py` 提供版本链接口：
+  `/api/scd/events`（提交维度变更）、`/api/scd/history`、`/api/scd/current`、
+  `/api/scd/as-of`（按时点重算）、`/api/scd/manifest`（事件回放清单）、
+  `/api/scd/reconcile`（清单核对）、`/api/scd/validate`（区间校验）、`/api/scd/verify`。
+- 迟到更正策略：**不重述已经生效的区间**，更正从处理时刻起生效，原区间保持不变，
+  回放清单记录 `late_correction=True`、`restated=False`，历史事实仍按原版本重算。
+- 同一维度表、自然键、事件ID 重复提交时复用首次处置，只追加一条 `duplicate` 回放记录，
+  不会再次关闭任何版本。
+- 回归测试：`cd backend && .venv/bin/python -m unittest discover -s tests -v`。
+
 领域：数据工程
 子方向：数仓与数据湖
